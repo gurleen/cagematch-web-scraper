@@ -39,18 +39,20 @@ class WorkerRow:
 @dataclass
 class WorkerProfile:
     worker_id: str
-    ring_name: Optional[str]
-    birth_name: Optional[str]
-    birthday: Optional[str]
-    birthplace: Optional[str]
-    height: Optional[str]
-    weight: Optional[str]
-    debut: Optional[str]
-    twitter: Optional[str]
-    instagram: Optional[str]
-    facebook: Optional[str]
-    wikipedia: Optional[str]
-    website: Optional[str]
+    ring_name: Optional[str] = None
+    birth_name: Optional[str] = None
+    birthday: Optional[str] = None
+    birthplace: Optional[str] = None
+    height: Optional[str] = None
+    weight: Optional[str] = None
+    debut: Optional[str] = None
+    rating: Optional[str] = None
+    votes: Optional[str] = None
+    twitter: Optional[str] = None
+    instagram: Optional[str] = None
+    facebook: Optional[str] = None
+    wikipedia: Optional[str] = None
+    website: Optional[str] = None
 
 
 HEADERS = {
@@ -184,6 +186,29 @@ def parse_worker_profile(html: str, worker_id: str) -> WorkerProfile:
         elif href and text.lower() in {"official website", "website"} and not socials["Website"]:
             socials["Website"] = href
 
+    # Rating and votes: heuristic from page text
+    import re
+    full_text = soup.get_text(" ", strip=True)
+    rating_val: Optional[str] = None
+    votes_val: Optional[str] = None
+    # Try to find a numeric rating and votes near the word Rating/Votes
+    m = re.search(r"Rating[^0-9]*([0-9]+\.[0-9]+).*?Votes[^0-9]*([0-9]+)", full_text, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        rating_val, votes_val = m.group(1), m.group(2)
+    else:
+        # Fallback: find span with class containing 'Rating' and a nearby number for votes
+        span = soup.find("span", class_=lambda c: c and "Rating" in c)
+        if span:
+            m2 = re.search(r"([0-9]+\.[0-9]+)", span.get_text(" ", strip=True))
+            if m2:
+                rating_val = m2.group(1)
+        # find any 'Votes' token and a number nearby
+        for node in soup.find_all(string=re.compile(r"Votes", re.IGNORECASE)):
+            mv = re.search(r"([0-9]{1,6})", node)
+            if mv:
+                votes_val = mv.group(1)
+                break
+
     return WorkerProfile(
         worker_id=worker_id,
         ring_name=info_map.get("Ring Name"),
@@ -193,6 +218,8 @@ def parse_worker_profile(html: str, worker_id: str) -> WorkerProfile:
         height=info_map.get("Height"),
         weight=info_map.get("Weight"),
         debut=info_map.get("Debut"),
+        rating=rating_val,
+        votes=votes_val,
         twitter=socials.get("Twitter"),
         instagram=socials.get("Instagram"),
         facebook=socials.get("Facebook"),
@@ -353,6 +380,7 @@ def rosters(
     max_pages: int = typer.Option(0, help="Max pages of the global list to scan if fallback used (0=all)"),
     profiles: bool = typer.Option(True, help="Whether to fetch profiles"),
     profile_limit: int = typer.Option(0, help="Limit number of profiles per promotion (0=all)"),
+    all_time: bool = typer.Option(True, help="Attempt to include alumni/all-time workers for the promotion"),
 ) -> None:
     """Scrape rosters for selected promotions using promotion roster pages if available, else fallback to scanning the global list."""
     import os
@@ -370,18 +398,35 @@ def rosters(
             raise typer.BadParameter(f"Unknown promotion: {key}")
         targets.append((key_norm, PROMOTION_NAME_BY_KEY[key_norm], PROMOTION_ID_BY_KEY[key_norm]))
 
-    # Attempt direct roster fetch first
+    # Attempt direct roster and alumni fetch first
     fetched_by_key: dict[str, List[WorkerRow]] = {}
     for key, promo_name, promo_id in targets:
-        roster_url = f"{BASE_URL}?id=8&nr={promo_id}&page=15"
+        combined: List[WorkerRow] = []
+        # Current roster
         try:
+            roster_url = f"{BASE_URL}?id=8&nr={promo_id}&page=15"
             resp = polite_get(session, roster_url, rate)
-            rows = parse_promotion_roster_page(resp.text, promo_name)
+            combined.extend(parse_promotion_roster_page(resp.text, promo_name))
         except Exception:
-            rows = []
+            pass
+        # Alumni or all workers (best-effort pages)
+        if all_time:
+            for page in ("16", "26"):
+                try:
+                    url = f"{BASE_URL}?id=8&nr={promo_id}&page={page}"
+                    resp = polite_get(session, url, rate)
+                    combined.extend(parse_promotion_roster_page(resp.text, promo_name))
+                except Exception:
+                    continue
+        # De-duplicate
+        uniq: Dict[str, WorkerRow] = {}
+        for r in combined:
+            if r.worker_id and r.worker_id not in uniq:
+                uniq[r.worker_id] = r
+        rows = list(uniq.values())
         if rows:
             fetched_by_key[key] = rows
-            typer.echo(f"{key.upper()}: fetched {len(rows)} from promotion roster page.")
+            typer.echo(f"{key.upper()}: fetched {len(rows)} from promotion pages.")
 
     # Fallback: scan global list if any target missing
     missing_keys = [k for k, _, _ in targets if k not in fetched_by_key]
@@ -402,7 +447,7 @@ def rosters(
         workers_path = os.path.join(out_dir, f"{key}_workers.csv")
         write_csv(workers_path, (asdict(w) for w in subset))
 
-        # Fetch and write profiles
+        # Fetch and write profiles (and enrich worker rows)
         if profiles:
             prof_list: List[WorkerProfile] = []
             subset_iter = subset if profile_limit == 0 else subset[:profile_limit]
@@ -411,7 +456,29 @@ def rosters(
                     continue
                 try:
                     resp = polite_get(session, w.profile_url, rate)
-                    prof_list.append(parse_worker_profile(resp.text, w.worker_id))
+                    prof = parse_worker_profile(resp.text, w.worker_id)
+                    prof_list.append(prof)
+                    # Enrich worker row
+                    for wr in subset:
+                        if wr.worker_id == w.worker_id:
+                            if not wr.birthday:
+                                wr.birthday = prof.birthday
+                            if not wr.birthplace:
+                                wr.birthplace = prof.birthplace
+                            if not wr.height_cm and (prof.height or ""):
+                                import re
+                                m = re.search(r"(\d{2,3})\s*cm", prof.height)
+                                if m:
+                                    wr.height_cm = m.group(1)
+                            if not wr.weight_kg and (prof.weight or ""):
+                                import re
+                                m = re.search(r"(\d{2,3})\s*kg", prof.weight)
+                                if m:
+                                    wr.weight_kg = m.group(1)
+                            if not wr.rating and prof.rating:
+                                wr.rating = prof.rating
+                            if not wr.votes and prof.votes:
+                                wr.votes = prof.votes
                 except Exception:
                     continue
             profiles_path = os.path.join(out_dir, f"{key}_profiles.csv")
