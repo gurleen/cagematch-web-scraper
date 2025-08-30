@@ -1,0 +1,6 @@
+worker_id,ring_name,birthday,birthplace,height_cm,weight_kg,promotion,rating,votes,profile_url
+761,Undertaker,24.03.1965,"Houston, Texas, USA",208,136,World Wrestling Entertainment,9.41,2517,https://www.cagematch.net/?id=2&nr=761&gimmick=Undertaker
+80,CM Punk,26.10.1978,"Chicago, Illinois, USA",183,99,World Wrestling Entertainment,9.28,2462,https://www.cagematch.net/?id=2&nr=80&gimmick=CM+Punk
+86,Bryan Danielson,22.05.1981,"Aberdeen, Washington, USA",173,89,All Elite Wrestling,9.61,2435,https://www.cagematch.net/?id=2&nr=86&gimmick=Bryan+Danielson
+691,John Cena,23.04.1977,"West Newbury, Massachusetts, USA",185,114,World Wrestling Entertainment,7.88,2428,https://www.cagematch.net/?id=2&nr=691&gimmick=John+Cena
+758,Chris Jericho,09.11.1970,"Manhasset, New York, USA",180,103,All Elite Wrestling,9.31,2281,https://www.cagematch.net/?id=2&nr=758&gimmick=Chris+Jericho
