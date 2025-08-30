@@ -279,3 +279,144 @@ def scrape(
 
     typer.echo("Done. CSVs written in " + out_dir)
 
+
+def iter_all_workers(session: requests.Session, rate: float, max_pages: int = 0) -> Iterable[WorkerRow]:
+    page_index = 0
+    offset = 0
+    while True:
+        url = LIST_URL + ("&s=" + str(offset) if offset else "")
+        resp = polite_get(session, url, rate)
+        rows = parse_worker_list(resp.text)
+        if not rows:
+            break
+        for r in rows:
+            yield r
+        page_index += 1
+        if max_pages and page_index >= max_pages:
+            break
+        offset += 100
+
+
+PROMOTION_NAME_BY_KEY = {
+    "wwe": "World Wrestling Entertainment",
+    "aew": "All Elite Wrestling",
+}
+
+PROMOTION_ID_BY_KEY = {
+    "wwe": 1,
+    "aew": 2287,
+}
+
+
+def parse_promotion_roster_page(html: str, promotion_name: str) -> List[WorkerRow]:
+    soup = BeautifulSoup(html, "lxml")
+    rows: List[WorkerRow] = []
+    seen: set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "id=2" in href and "nr=" in href:
+            text = a.get_text(strip=True)
+            # Extract id
+            try:
+                from urllib.parse import parse_qs, urlparse
+
+                url = BASE_URL.rstrip("/") + "/" + href.lstrip("/")
+                qs = parse_qs(urlparse(url).query)
+                worker_id = (qs.get("nr") or [""])[0]
+            except Exception:
+                worker_id = ""
+            if not worker_id or worker_id in seen:
+                continue
+            seen.add(worker_id)
+            rows.append(
+                WorkerRow(
+                    worker_id=worker_id,
+                    ring_name=text,
+                    birthday=None,
+                    birthplace=None,
+                    height_cm=None,
+                    weight_kg=None,
+                    promotion=promotion_name,
+                    rating=None,
+                    votes=None,
+                    profile_url=BASE_URL.rstrip("/") + "/" + href.lstrip("/"),
+                )
+            )
+    return rows
+
+
+@app.command()
+def rosters(
+    promotions: List[str] = typer.Option(["wwe", "aew"], help="Promotions to scrape: wwe, aew"),
+    out_dir: str = typer.Option("./data/rosters", help="Base output directory"),
+    rate: float = typer.Option(1.0, help="Seconds to wait between requests"),
+    max_pages: int = typer.Option(0, help="Max pages of the global list to scan if fallback used (0=all)"),
+    profiles: bool = typer.Option(True, help="Whether to fetch profiles"),
+    profile_limit: int = typer.Option(0, help="Limit number of profiles per promotion (0=all)"),
+) -> None:
+    """Scrape rosters for selected promotions using promotion roster pages if available, else fallback to scanning the global list."""
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+
+    session = requests.Session()
+    if not can_fetch_robots(session, LIST_URL):
+        typer.echo("Blocked by robots.txt for the list URL.")
+        raise typer.Exit(code=2)
+
+    targets = []
+    for key in promotions:
+        key_norm = key.lower()
+        if key_norm not in PROMOTION_NAME_BY_KEY:
+            raise typer.BadParameter(f"Unknown promotion: {key}")
+        targets.append((key_norm, PROMOTION_NAME_BY_KEY[key_norm], PROMOTION_ID_BY_KEY[key_norm]))
+
+    # Attempt direct roster fetch first
+    fetched_by_key: dict[str, List[WorkerRow]] = {}
+    for key, promo_name, promo_id in targets:
+        roster_url = f"{BASE_URL}?id=8&nr={promo_id}&page=15"
+        try:
+            resp = polite_get(session, roster_url, rate)
+            rows = parse_promotion_roster_page(resp.text, promo_name)
+        except Exception:
+            rows = []
+        if rows:
+            fetched_by_key[key] = rows
+            typer.echo(f"{key.upper()}: fetched {len(rows)} from promotion roster page.")
+
+    # Fallback: scan global list if any target missing
+    missing_keys = [k for k, _, _ in targets if k not in fetched_by_key]
+    if missing_keys:
+        typer.echo("Scanning global workers list for missing promotions...")
+        all_rows = list(iter_all_workers(session, rate, max_pages=max_pages))
+        for key, promo_name, _ in targets:
+            if key in fetched_by_key:
+                continue
+            subset = [r for r in all_rows if (r.promotion or "").strip() == promo_name]
+            fetched_by_key[key] = subset
+            typer.echo(f"{key.upper()}: {len(subset)} workers matched promotion '{promo_name}'.")
+
+    for key, promo_name, _ in targets:
+        subset = fetched_by_key.get(key, [])
+
+        # Write workers subset
+        workers_path = os.path.join(out_dir, f"{key}_workers.csv")
+        write_csv(workers_path, (asdict(w) for w in subset))
+
+        # Fetch and write profiles
+        if profiles:
+            prof_list: List[WorkerProfile] = []
+            subset_iter = subset if profile_limit == 0 else subset[:profile_limit]
+            for w in tqdm(subset_iter, desc=f"{key.upper()} profiles"):
+                if not can_fetch_robots(session, w.profile_url):
+                    continue
+                try:
+                    resp = polite_get(session, w.profile_url, rate)
+                    prof_list.append(parse_worker_profile(resp.text, w.worker_id))
+                except Exception:
+                    continue
+            profiles_path = os.path.join(out_dir, f"{key}_profiles.csv")
+            write_csv(profiles_path, (asdict(p) for p in prof_list))
+            typer.echo(f"Wrote {workers_path} and {profiles_path}")
+        else:
+            typer.echo(f"Wrote {workers_path}")
+
