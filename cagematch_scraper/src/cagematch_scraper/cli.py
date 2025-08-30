@@ -372,6 +372,49 @@ def parse_promotion_roster_page(html: str, promotion_name: str) -> List[WorkerRo
     return rows
 
 
+def crawl_promotion_workers(
+    session: requests.Session,
+    promotion_id: int,
+    promotion_name: str,
+    rate: float,
+    pages: List[str],
+    max_pages_per_view: int = 0,
+) -> List[WorkerRow]:
+    """Iterate promotion pages (e.g., 15 roster, 16/26 alumni) with pagination offsets."""
+    from urllib.parse import urlencode
+
+    unique: Dict[str, WorkerRow] = {}
+    for page in pages:
+        seen_any = False
+        offset = 0
+        page_count = 0
+        while True:
+            if page.isdigit():
+                url = f"{BASE_URL}?id=8&nr={promotion_id}&page={page}" + (f"&s={offset}" if offset else "")
+            else:
+                url = f"{BASE_URL}?id=8&nr={promotion_id}&view={page}" + (f"&s={offset}" if offset else "")
+            try:
+                resp = polite_get(session, url, rate)
+            except Exception:
+                break
+            rows = parse_promotion_roster_page(resp.text, promotion_name)
+            # Add new rows; break if none
+            new_added = 0
+            for r in rows:
+                if r.worker_id and r.worker_id not in unique:
+                    unique[r.worker_id] = r
+                    new_added += 1
+            seen_any = seen_any or (len(rows) > 0)
+            page_count += 1
+            if new_added == 0:
+                break
+            if max_pages_per_view and page_count >= max_pages_per_view:
+                break
+            offset += 100
+        # If this view yielded nothing at all, continue to next view
+    return list(unique.values())
+
+
 @app.command()
 def rosters(
     promotions: List[str] = typer.Option(["wwe", "aew"], help="Promotions to scrape: wwe, aew"),
@@ -398,32 +441,18 @@ def rosters(
             raise typer.BadParameter(f"Unknown promotion: {key}")
         targets.append((key_norm, PROMOTION_NAME_BY_KEY[key_norm], PROMOTION_ID_BY_KEY[key_norm]))
 
-    # Attempt direct roster and alumni fetch first
+    # Attempt direct roster and alumni fetch first (with pagination)
     fetched_by_key: dict[str, List[WorkerRow]] = {}
     for key, promo_name, promo_id in targets:
-        combined: List[WorkerRow] = []
-        # Current roster
-        try:
-            roster_url = f"{BASE_URL}?id=8&nr={promo_id}&page=15"
-            resp = polite_get(session, roster_url, rate)
-            combined.extend(parse_promotion_roster_page(resp.text, promo_name))
-        except Exception:
-            pass
-        # Alumni or all workers (best-effort pages)
-        if all_time:
-            for page in ("16", "26"):
-                try:
-                    url = f"{BASE_URL}?id=8&nr={promo_id}&page={page}"
-                    resp = polite_get(session, url, rate)
-                    combined.extend(parse_promotion_roster_page(resp.text, promo_name))
-                except Exception:
-                    continue
-        # De-duplicate
-        uniq: Dict[str, WorkerRow] = {}
-        for r in combined:
-            if r.worker_id and r.worker_id not in uniq:
-                uniq[r.worker_id] = r
-        rows = list(uniq.values())
+        pages = ["15"] + (["16", "26"] if all_time else [])
+        rows = crawl_promotion_workers(
+            session=session,
+            promotion_id=promo_id,
+            promotion_name=promo_name,
+            rate=rate,
+            pages=pages,
+            max_pages_per_view=0,
+        )
         if rows:
             fetched_by_key[key] = rows
             typer.echo(f"{key.upper()}: fetched {len(rows)} from promotion pages.")
@@ -486,4 +515,73 @@ def rosters(
             typer.echo(f"Wrote {workers_path} and {profiles_path}")
         else:
             typer.echo(f"Wrote {workers_path}")
+
+
+@app.command()
+def rosters_exhaustive(
+    promotions: List[str] = typer.Option(["wwe", "aew"], help="Promotions to scrape: wwe, aew"),
+    out_dir: str = typer.Option("./data/rosters_exhaustive", help="Base output directory"),
+    rate: float = typer.Option(1.0, help="Seconds to wait between requests"),
+    max_pages: int = typer.Option(0, help="Max pages from global list to scan (0=all ~32k)"),
+    profiles: bool = typer.Option(False, help="Also write profiles CSV for matches"),
+    cache_dir: str = typer.Option("./cache/profiles", help="Cache directory for profile HTML"),
+) -> None:
+    """Exhaustively scan the global workers list, fetching profiles and including any worker whose profile links to the target promotions. Heavy, but most complete."""
+    import os
+    from pathlib import Path
+    os.makedirs(out_dir, exist_ok=True)
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+
+    session = requests.Session()
+    if not can_fetch_robots(session, LIST_URL):
+        typer.echo("Blocked by robots.txt for the list URL.")
+        raise typer.Exit(code=2)
+
+    targets = []
+    for key in promotions:
+        key_norm = key.lower()
+        if key_norm not in PROMOTION_NAME_BY_KEY:
+            raise typer.BadParameter(f"Unknown promotion: {key}")
+        targets.append((key_norm, PROMOTION_NAME_BY_KEY[key_norm], PROMOTION_ID_BY_KEY[key_norm]))
+
+    def get_profile_html(worker: WorkerRow) -> str:
+        cache_path = Path(cache_dir) / f"{worker.worker_id}.html"
+        if cache_path.exists():
+            return cache_path.read_text(encoding="utf-8", errors="ignore")
+        resp = polite_get(session, worker.profile_url, rate)
+        text = resp.text
+        try:
+            cache_path.write_text(text, encoding="utf-8")
+        except Exception:
+            pass
+        return text
+
+    all_workers = list(iter_all_workers(session, rate, max_pages=max_pages))
+    typer.echo(f"Scanning profiles for {len(all_workers)} workers...")
+
+    for key, promo_name, promo_id in targets:
+        selected: List[WorkerRow] = []
+        prof_list: List[WorkerProfile] = []
+        for w in tqdm(all_workers, desc=f"{key.upper()} find"):
+            try:
+                html = get_profile_html(w)
+            except Exception:
+                continue
+            # Include if the profile links to the promotion id
+            if f"id=8&nr={promo_id}" in html:
+                selected.append(w)
+                if profiles:
+                    try:
+                        prof_list.append(parse_worker_profile(html, w.worker_id))
+                    except Exception:
+                        pass
+        # Write outputs
+        workers_path = os.path.join(out_dir, f"{key}_workers.csv")
+        write_csv(workers_path, (asdict(x) for x in selected))
+        if profiles:
+            profiles_path = os.path.join(out_dir, f"{key}_profiles.csv")
+            write_csv(profiles_path, (asdict(p) for p in prof_list))
+            typer.echo(f"{key.upper()}: wrote {workers_path} and {profiles_path} ({len(selected)} workers)")
+        else:
+            typer.echo(f"{key.UPPER()}: wrote {workers_path} ({len(selected)} workers)")
 
